@@ -7,15 +7,11 @@
 
 ## Сборка
 
-\```bash
 go build -o multicast-discovery .
-\```
 
 ## Запуск
 
-\```bash
 ./multicast-discovery <multicast-адрес> <имя интерфейса> [порт]
-\```
 
 ### Параметры:
     multicast-адрес - адрес multicast-группы (IPv4 или IPv6)
@@ -25,11 +21,7 @@ go build -o multicast-discovery .
 ### Примеры запуска
 
 IPv4:
-\```bash
 ./multicast-discovery 239.1.1.1 lo 9998
-\```
 
 IPv6:
-\```bash
 ./multicast-discovery ff02::1234 lo 9991
-\```
