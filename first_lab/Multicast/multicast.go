@@ -1,8 +1,8 @@
 package udp
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -14,7 +14,12 @@ import (
 	"golang.org/x/net/ipv6"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
+	"github.com/google/uuid"
 )
+
+var magic = [4]byte{'D', 'L', 'A', 'B'}
+
+const msgLen = 4 + 16
 
 type multicastConn interface {
 	JoinGroup(ifi *net.Interface, group net.Addr) error
@@ -24,7 +29,7 @@ type multicastConn interface {
 type Event struct {
 	addr       net.Addr
 	timeRecive time.Time
-	pid        uint32
+	id         uuid.UUID
 }
 
 type Info struct {
@@ -37,27 +42,27 @@ type Node struct {
 	iface     *net.Interface
 	groupAddr *net.UDPAddr
 	events    chan Event
-	selfPid   uint32
+	selfID    uuid.UUID
 }
 
 func (node *Node) Tracker(ctx context.Context) {
-	alive := make(map[uint32]Info)
+	alive := make(map[uuid.UUID]Info)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case e := <-node.events:
-			alive[e.pid] = Info{addr: e.addr, timeRecive: e.timeRecive}
+			alive[e.id] = Info{addr: e.addr, timeRecive: e.timeRecive}
 			fmt.Println("Устройства с копией:")
 			for _, device := range alive {
 				fmt.Println(device.addr)
 			}
 		case <-ticker.C:
 			flag := false
-			for pid, device := range alive {
+			for id, device := range alive {
 				if time.Since(device.timeRecive) >= 5*time.Second {
 					flag = true
-					delete(alive, pid)
+					delete(alive, id)
 				}
 			}
 			if flag {
@@ -73,28 +78,39 @@ func (node *Node) Tracker(ctx context.Context) {
 }
 
 func (node *Node) Recive() {
-	buf := make([]byte, 4)
+	buf := make([]byte, msgLen)
 	for {
-		_, addr, err := node.conn.ReadFrom(buf)
+		n, addr, err := node.conn.ReadFrom(buf)
 		if err != nil {
 			return
 		}
-		pid := binary.BigEndian.Uint32(buf)
-		if pid != node.selfPid {
-			node.events <- Event{addr: addr, timeRecive: time.Now(), pid: pid}
+		if n != msgLen {
+			continue
+		}
+		if !bytes.Equal(buf[:4], magic[:]) {
+			continue
+		}
+		var id uuid.UUID
+		copy(id[:], buf[4:msgLen])
+		if id != node.selfID {
+			node.events <- Event{addr: addr, timeRecive: time.Now(), id: id}
 		}
 	}
 }
 
 func (node *Node) Send(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, uint32(node.selfPid))
+	buf := make([]byte, 0, msgLen)
+	buf = append(buf, magic[:]...)
+	buf = append(buf, node.selfID[:]...)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			node.conn.WriteTo(buf, node.groupAddr)
+			_, err := node.conn.WriteTo(buf, node.groupAddr)
+			if err != nil {
+				log.Printf("Ошибка отправления heartbeat: %v", err)
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -103,7 +119,7 @@ func (node *Node) Send(ctx context.Context) {
 }
 
 func Multicast(ip net.IP, ifaceName string, port int) {
-	selfPid := uint32(os.Getpid())
+	selfUid := uuid.New()
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var errorSocket error
@@ -152,10 +168,14 @@ func Multicast(ip net.IP, ifaceName string, port int) {
 		log.Fatal("Не удалось подключиться к группе")
 	}
 
-	ipConn.SetMulticastInterface(iface)
+	err = ipConn.SetMulticastInterface(iface)
+	if (err != nil) {
+		log.Fatal("Не удалось настроить заданный интерфейс: ", err)
+		return
+	}
 
 	events := make(chan Event, 4)
-	node := Node{conn: conn, iface: iface, groupAddr: destAddr, events: events, selfPid: selfPid}
+	node := Node{conn: conn, iface: iface, groupAddr: destAddr, events: events, selfID: selfUid}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var wg sync.WaitGroup
