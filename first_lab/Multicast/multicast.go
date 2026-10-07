@@ -11,10 +11,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"golang.org/x/net/ipv6"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
+
 	"github.com/google/uuid"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
 var magic = [4]byte{'D', 'L', 'A', 'B'}
@@ -53,9 +54,10 @@ func (node *Node) Tracker(ctx context.Context) {
 		select {
 		case e := <-node.events:
 			alive[e.id] = Info{addr: e.addr, timeRecive: e.timeRecive}
+			fmt.Println("id запущенной программы: ", node.selfID)
 			fmt.Println("Устройства с копией:")
-			for _, device := range alive {
-				fmt.Println(device.addr)
+			for id, device := range alive {
+				fmt.Println(device.addr, " ", id)
 			}
 		case <-ticker.C:
 			flag := false
@@ -66,9 +68,10 @@ func (node *Node) Tracker(ctx context.Context) {
 				}
 			}
 			if flag {
+				fmt.Println("id запущенной программы: ", node.selfID)
 				fmt.Println("Обновленный список")
-				for _, device := range alive {
-					fmt.Println(device.addr)
+				for id, device := range alive {
+					fmt.Println(device.addr, " ", id)
 				}
 			}
 		case <-ctx.Done():
@@ -134,7 +137,7 @@ func Multicast(ip net.IP, ifaceName string, port int) {
 		},
 	}
 
-    var conn net.PacketConn
+	var conn net.PacketConn
 	var ipConn multicastConn
 	var destAddr *net.UDPAddr
 	var err error
@@ -144,22 +147,21 @@ func Multicast(ip net.IP, ifaceName string, port int) {
 		log.Fatal("Не найден интерфейс")
 	}
 
-	if (ip.To4() != nil) {
-	conn, err = lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.Fatal("Ошибка при создании сокета")
+	if ip.To4() != nil {
+		conn, err = lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", port))
+		if err != nil {
+			log.Fatal("Ошибка при создании сокета")
 		}
 		ipConn = ipv4.NewPacketConn(conn)
 		destAddr = &net.UDPAddr{IP: ip, Port: port}
 	} else {
-			conn, err = lc.ListenPacket(context.Background(), "udp6", fmt.Sprintf(":%d", port))
+		conn, err = lc.ListenPacket(context.Background(), "udp6", fmt.Sprintf(":%d", port))
 		if err != nil {
 			log.Fatal("Ошибка при создании сокета")
 		}
-			ipConn = ipv6.NewPacketConn(conn)
-			destAddr = &net.UDPAddr{IP: ip, Port: port, Zone : ifaceName}
-		}    
-
+		ipConn = ipv6.NewPacketConn(conn)
+		destAddr = &net.UDPAddr{IP: ip, Port: port, Zone: ifaceName}
+	}
 
 	groupAddr := &net.UDPAddr{IP: ip}
 
@@ -169,7 +171,7 @@ func Multicast(ip net.IP, ifaceName string, port int) {
 	}
 
 	err = ipConn.SetMulticastInterface(iface)
-	if (err != nil) {
+	if err != nil {
 		log.Fatal("Не удалось настроить заданный интерфейс: ", err)
 		return
 	}
