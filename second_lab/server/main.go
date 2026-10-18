@@ -78,7 +78,7 @@ func (m *speedMeter) run() {
 }
 
 func (m *speedMeter) print(delta int64, deltaTime time.Duration, total int64, elapsed time.Duration) {
-	log.Printf("[%s] мгновенная: %s, средняя: %s, принято: %s",
+	log.Printf("%s мгновенная %12s, средняя %12s, принято %11s",
 		m.client, formatSpeed(delta, deltaTime), formatSpeed(total, elapsed), formatBytes(float64(total)))
 }
 
@@ -91,47 +91,52 @@ func formatSpeed(bytes int64, d time.Duration) string {
 }
 
 func formatBytes(n float64) string {
-	return fmt.Sprintf("%.2f МБ", n/toMb)
+	return fmt.Sprintf("%.1f МБ", n/toMb)
 }
 
-func handleClient(conn net.Conn) {
+type result struct {
+	name     string
+	received uint64
+}
+
+func handleClient(conn net.Conn, id string) {
 	defer conn.Close()
-	client := conn.RemoteAddr().String()
-	log.Printf("[%s] подключился", client)
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[%s] внутренняя ошибка: %v", client, r)
+			log.Printf("%s внутренняя ошибка: %v", id, r)
 		}
 	}()
 
-	err := receiveFile(conn, client)
-	if err != nil {
-		log.Printf("[%s] ошибка: %v", client, err)
-	} else {
-		log.Printf("[%s] файл принят успешно", client)
+	res, err := receiveFile(conn, id)
+	switch {
+	case err == nil:
+		log.Printf("%s файл %s принят", id, res.name)
+	case res.name != "":
+		log.Printf("%s ошибка при приёме %s: %v", id, res.name, err)
+	default:
+		log.Printf("%s ошибка: %v", id, err)
 	}
 
 	if werr := protocol.SendAnswer(conn, err == nil); werr != nil {
-		log.Printf("[%s] не удалось отправить ответ: %v", client, werr)
+		log.Printf("%s не удалось отправить ответ: %v", id, werr)
 	}
 }
 
-func receiveFile(conn net.Conn, client string) (err error) {
+func receiveFile(conn net.Conn, id string) (res result, err error) {
 	dataLen, size, name, err := protocol.FirstProtReceive(conn)
 	if err != nil {
-		return err
+		return res, err
 	}
+	res.name = name
 	if err := checkName(name); err != nil {
-		return err
+		return res, err
 	}
 
 	f, path, err := createUnique(uploadDir, name)
-
 	if err != nil {
-		return fmt.Errorf("создание файла: %w", err)
+		return res, fmt.Errorf("создание файла: %w", err)
 	}
-	log.Printf("[%s] Принмаю файл %s", client, name)
 
 	defer func() {
 		if cerr := f.Close(); cerr != nil && err == nil {
@@ -142,37 +147,36 @@ func receiveFile(conn net.Conn, client string) (err error) {
 		}
 	}()
 
-	meter := startSpeedMeter(client)
+	meter := startSpeedMeter(id)
 	defer meter.stop()
 
 	buf := make([]byte, protocol.MaxChunkData)
-	var received uint64
 	for {
-		if received+uint64(dataLen) > size {
-			return fmt.Errorf("клиент прислал больше заявленных %d байт", size)
+		if res.received+uint64(dataLen) > size {
+			return res, fmt.Errorf("клиент прислал больше заявленных %d байт", size)
 		}
 		if _, err := io.ReadFull(conn, buf[:dataLen]); err != nil {
-			return fmt.Errorf("чтение данных: %w", err)
+			return res, fmt.Errorf("чтение данных: %w", err)
 		}
 		if _, err := f.Write(buf[:dataLen]); err != nil {
-			return fmt.Errorf("запись в файл: %w", err)
+			return res, fmt.Errorf("запись в файл: %w", err)
 		}
-		received += uint64(dataLen)
+		res.received += uint64(dataLen)
 		meter.add(int64(dataLen))
 
 		dataLen, err = protocol.ProtReceiveLen(conn)
 		if err != nil {
-			return fmt.Errorf("чтение длины кадра: %w", err)
+			return res, fmt.Errorf("чтение длины кадра: %w", err)
 		}
 		if dataLen == 0 {
 			break
 		}
 	}
 
-	if received != size {
-		return fmt.Errorf("получено %d байт, а заявлено %d", received, size)
+	if res.received != size {
+		return res, fmt.Errorf("получено %d байт, а заявлено %d", res.received, size)
 	}
-	return nil
+	return res, nil
 }
 
 func checkName(name string) error {
@@ -218,6 +222,8 @@ func main() {
 		log.Fatalf("Не удалось создать каталог %s: %v", uploadDir, err)
 	}
 
+	log.SetFlags(0)
+
 	ln, err := net.Listen("tcp", ":"+os.Args[1])
 	if err != nil {
 		log.Fatalf("Ошибка создания сокета: %v", err)
@@ -226,21 +232,24 @@ func main() {
 	log.Printf("Сервер слушает порт %d", port)
 
 	sem := make(chan struct{}, maxClients)
+	clientNum := 0
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("Ошибка принятия подключения: %v", err)
 			continue
 		}
+		clientNum++
+		id := fmt.Sprintf("#%d", clientNum)
 
 		select {
 		case sem <- struct{}{}:
 			go func() {
 				defer func() { <-sem }()
-				handleClient(conn)
+				handleClient(conn, id)
 			}()
 		default:
-			log.Printf("[%s] отклонён: достигнут лимит %d клиентов", conn.RemoteAddr(), maxClients)
+			log.Printf("%s отклонён: достигнут лимит %d клиентов", id, maxClients)
 			protocol.SendAnswer(conn, false)
 			conn.Close()
 		}
