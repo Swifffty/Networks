@@ -2,114 +2,107 @@ package protocol
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"os"
+	"time"
 	"unicode/utf8"
 )
 
 const (
 	MaxFileSize = 1 << 40
 	MaxNameLen  = 4096
-	SizeBuffer  = 1024
-	SizeAnswer  = 4
+	SizeBuffer  = 4096 * 2
+	SizeAnswer  = 1
+	IoTimeout   = 30 * time.Second
 
-	sizeLenData = 4
+	magic       = "PROT"
+	sizeMagic   = len(magic)
+	sizeNameLen = 2
 	sizeFileLen = 8
-	sizeNameLen = 4
+	prefixSize  = sizeMagic + sizeNameLen
 
-	offsetLenData = 0
-	endLenData    = offsetLenData + sizeLenData // 4
-	offsetFileLen = endLenData                  // 4
-	endFileLen    = offsetFileLen + sizeFileLen // 12
-	offsetNameLen = endFileLen                  // 12
-	endNameLen    = offsetNameLen + sizeNameLen // 16
-
-	MaxChunkData = SizeBuffer - endLenData
-
-	answerCorrect = "OKEY"
-	answerFail    = "FAIL"
+	statusOK   byte = 0
+	statusFail byte = 1
 )
 
-func FirstProtSend(fileName string, sizeFile int64, file *os.File, buf []byte) (int, error) {
-	if len(fileName) == 0 || len(fileName) > MaxNameLen {
-		return 0, fmt.Errorf("недопустимая длина имени файла: %d байт", len(fileName))
+func validateName(name string) error {
+	if len(name) == 0 || len(name) > MaxNameLen {
+		return fmt.Errorf("длина имени файла должна быть от 1 до %d байт, получено %d", MaxNameLen, len(name))
 	}
-	binary.BigEndian.PutUint64(buf[offsetFileLen:endFileLen], uint64(sizeFile))
-	binary.BigEndian.PutUint32(buf[offsetNameLen:endNameLen], uint32(len(fileName)))
-	copied := copy(buf[endNameLen:], fileName)
-	dataStart := endNameLen + copied
-
-	n, err := file.Read(buf[dataStart:])
-	binary.BigEndian.PutUint32(buf[offsetLenData:endLenData], uint32(n))
-	return dataStart + n, err
+	if !utf8.ValidString(name) {
+		return errors.New("имя файла не является корректной строкой UTF-8")
+	}
+	return nil
 }
 
-func ProtSend(file *os.File, buf []byte) (int, error) {
-	n, err := file.Read(buf[endLenData:])
-	if n == 0 {
-		return 0, err
+func validateSize(size uint64) error {
+	if size > MaxFileSize {
+		return fmt.Errorf("размер файла %d байт превышает 1 ТБ", size)
 	}
-	binary.BigEndian.PutUint32(buf[offsetLenData:endLenData], uint32(n))
-	return endLenData + n, err
+	return nil
 }
 
-func SendEnd(w io.Writer) error {
-	var end [sizeLenData]byte
-	_, err := w.Write(end[:])
+func WriteHeader(w io.Writer, name string, size uint64) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if err := validateSize(size); err != nil {
+		return err
+	}
+
+	buf := make([]byte, prefixSize+len(name)+sizeFileLen)
+	copy(buf, magic)
+	binary.BigEndian.PutUint16(buf[sizeMagic:prefixSize], uint16(len(name)))
+	copy(buf[prefixSize:], name)
+	binary.BigEndian.PutUint64(buf[prefixSize+len(name):], size)
+
+	_, err := w.Write(buf)
 	return err
 }
 
-func Check(buf []byte) bool {
-	return len(buf) >= SizeAnswer && string(buf[:SizeAnswer]) == answerCorrect
-}
-
-func FirstProtReceive(r io.Reader) (dataLen uint32, size uint64, name string, err error) {
-	var head [endNameLen]byte
-	if _, err = io.ReadFull(r, head[:]); err != nil {
-		return 0, 0, "", fmt.Errorf("чтение заголовка: %w", err)
+func ReadHeader(r io.Reader) (name string, size uint64, err error) {
+	var prefix [prefixSize]byte
+	if _, err = io.ReadFull(r, prefix[:]); err != nil {
+		return "", 0, fmt.Errorf("чтение заголовка: %w", err)
 	}
-	dataLen = binary.BigEndian.Uint32(head[offsetLenData:endLenData])
-	size = binary.BigEndian.Uint64(head[offsetFileLen:endFileLen])
-	nameLen := binary.BigEndian.Uint32(head[offsetNameLen:endNameLen])
-
-	if size > MaxFileSize {
-		return 0, 0, "", fmt.Errorf("заявленный размер %d больше 1 ТБ", size)
+	if string(prefix[:sizeMagic]) != magic {
+		return "", 0, errors.New("неверная сигнатура протокола")
 	}
-	if nameLen == 0 || nameLen > MaxNameLen {
-		return 0, 0, "", fmt.Errorf("недопустимая длина имени: %d", nameLen)
-	}
-	if dataLen > MaxChunkData {
-		return 0, 0, "", fmt.Errorf("недопустимая длина кадра: %d", dataLen)
+	nameLen := binary.BigEndian.Uint16(prefix[sizeMagic:])
+	if nameLen == 0 || int(nameLen) > MaxNameLen {
+		return "", 0, fmt.Errorf("неверная длина имени файла: %d", nameLen)
 	}
 
 	nameBuf := make([]byte, nameLen)
 	if _, err = io.ReadFull(r, nameBuf); err != nil {
-		return 0, 0, "", fmt.Errorf("чтение имени: %w", err)
+		return "", 0, fmt.Errorf("чтение имени: %w", err)
 	}
-	if !utf8.Valid(nameBuf) {
-		return 0, 0, "", fmt.Errorf("имя файла не в UTF-8")
+	name = string(nameBuf)
+	if err = validateName(name); err != nil {
+		return "", 0, err
 	}
-	return dataLen, size, string(nameBuf), nil
-}
 
-func ProtReceiveLen(r io.Reader) (uint32, error) {
-	var b [sizeLenData]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return 0, err
+	var sizeBuf [sizeFileLen]byte
+	if _, err = io.ReadFull(r, sizeBuf[:]); err != nil {
+		return "", 0, fmt.Errorf("чтение размера: %w", err)
 	}
-	n := binary.BigEndian.Uint32(b[:])
-	if n > MaxChunkData {
-		return 0, fmt.Errorf("недопустимая длина кадра: %d", n)
+	size = binary.BigEndian.Uint64(sizeBuf[:])
+	if err = validateSize(size); err != nil {
+		return "", 0, err
 	}
-	return n, nil
+	return name, size, nil
 }
 
 func SendAnswer(w io.Writer, ok bool) error {
-	answer := answerFail
+	status := statusFail
 	if ok {
-		answer = answerCorrect
+		status = statusOK
 	}
-	_, err := io.WriteString(w, answer)
+	_, err := w.Write([]byte{status})
 	return err
+}
+
+func Check(buf []byte) bool {
+	return len(buf) == SizeAnswer && buf[0] == statusOK
 }
