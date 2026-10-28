@@ -8,9 +8,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"second_lab/protocol"
@@ -19,35 +22,39 @@ import (
 const (
 	uploadDir     = "uploads"
 	speedInterval = 3 * time.Second
-	maxStoredName = 200
 	toMb          = 1024 * 1024
 	maxClients    = 16
 )
 
 type speedMeter struct {
-	client   string
+	label    atomic.Value
 	start    time.Time
 	total    atomic.Int64
 	done     chan struct{}
 	finished chan struct{}
+	once     sync.Once
 }
 
-func startSpeedMeter(client string) *speedMeter {
+func startSpeedMeter(label string) *speedMeter {
 	m := &speedMeter{
-		client:   client,
 		start:    time.Now(),
 		done:     make(chan struct{}),
 		finished: make(chan struct{}),
 	}
+	m.label.Store(label)
 	go m.run()
 	return m
 }
 
+func (m *speedMeter) setLabel(label string) { m.label.Store(label) }
+
 func (m *speedMeter) add(n int64) { m.total.Add(n) }
 
 func (m *speedMeter) stop() {
-	close(m.done)
-	<-m.finished
+	m.once.Do(func() {
+		close(m.done)
+		<-m.finished
+	})
 }
 
 func (m *speedMeter) run() {
@@ -57,7 +64,6 @@ func (m *speedMeter) run() {
 
 	lastTime := m.start
 	var lastTotal int64
-	printed := false
 
 	for {
 		select {
@@ -65,13 +71,10 @@ func (m *speedMeter) run() {
 			total := m.total.Load()
 			m.print(total-lastTotal, now.Sub(lastTime), total, now.Sub(m.start))
 			lastTime, lastTotal = now, total
-			printed = true
 		case <-m.done:
-			if !printed {
-				elapsed := time.Since(m.start)
-				total := m.total.Load()
-				m.print(total, elapsed, total, elapsed)
-			}
+			now := time.Now()
+			total := m.total.Load()
+			m.print(total-lastTotal, now.Sub(lastTime), total, now.Sub(m.start))
 			return
 		}
 	}
@@ -79,7 +82,7 @@ func (m *speedMeter) run() {
 
 func (m *speedMeter) print(delta int64, deltaTime time.Duration, total int64, elapsed time.Duration) {
 	log.Printf("%s: мгновенная %12s, средняя %12s, принято %11s",
-		m.client, formatSpeed(delta, deltaTime), formatSpeed(total, elapsed), formatBytes(float64(total)))
+		m.label.Load().(string), formatSpeed(delta, deltaTime), formatSpeed(total, elapsed), formatBytes(float64(total)))
 }
 
 func formatSpeed(bytes int64, d time.Duration) string {
@@ -94,6 +97,17 @@ func formatBytes(n float64) string {
 	return fmt.Sprintf("%.1f МБ", n/toMb)
 }
 
+type countingReader struct {
+	r io.Reader
+	m *speedMeter
+}
+
+func (c countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.m.add(int64(n))
+	return n, err
+}
+
 type result struct {
 	name     string
 	path     string
@@ -101,18 +115,29 @@ type result struct {
 }
 
 func handleClient(conn net.Conn, id string) {
+	runtime.LockOSThread()
 	defer conn.Close()
+
+	meter := startSpeedMeter(id)
+	answered := false
 
 	defer func() {
 		if r := recover(); r != nil {
+			meter.stop()
 			log.Printf("%s внутренняя ошибка: %v", id, r)
+			if !answered {
+				conn.SetWriteDeadline(time.Now().Add(protocol.IoTimeout))
+				protocol.SendAnswer(conn, false)
+			}
 		}
 	}()
 
-	res, err := receiveFile(conn, id)
+	res, err := receiveFile(conn, id, meter)
+	meter.stop()
 
 	conn.SetWriteDeadline(time.Now().Add(protocol.IoTimeout))
 	werr := protocol.SendAnswer(conn, err == nil)
+	answered = true
 
 	switch {
 	case err == nil && werr == nil:
@@ -126,13 +151,17 @@ func handleClient(conn net.Conn, id string) {
 	}
 }
 
-func receiveFile(conn net.Conn, id string) (res result, err error) {
+func receiveFile(conn net.Conn, id string, meter *speedMeter) (result, error) {
+	var res result
+	in := countingReader{conn, meter}
+
 	conn.SetReadDeadline(time.Now().Add(protocol.IoTimeout))
-	name, size, err := protocol.ReadHeader(conn)
+	name, size, err := protocol.ReadHeader(in)
 	if err != nil {
 		return res, err
 	}
 	res.name = name
+	meter.setLabel(id + " " + name)
 	log.Printf("%s %s передаёт %s (%s)", id, conn.RemoteAddr(), name, formatBytes(float64(size)))
 	if err := checkName(name); err != nil {
 		return res, err
@@ -144,17 +173,15 @@ func receiveFile(conn net.Conn, id string) (res result, err error) {
 	}
 	res.path = path
 
+	closed, saved := false, false
 	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("закрытие файла: %w", cerr)
+		if !closed {
+			f.Close()
 		}
-		if err != nil {
+		if !saved {
 			os.Remove(path)
 		}
 	}()
-
-	meter := startSpeedMeter(id + " " + name)
-	defer meter.stop()
 
 	buf := make([]byte, protocol.SizeBuffer)
 	for res.received < size {
@@ -163,13 +190,12 @@ func receiveFile(conn net.Conn, id string) (res result, err error) {
 			chunk = left
 		}
 		conn.SetReadDeadline(time.Now().Add(protocol.IoTimeout))
-		n, rerr := conn.Read(buf[:chunk])
+		n, rerr := in.Read(buf[:chunk])
 		if n > 0 {
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return res, fmt.Errorf("запись в файл: %w", werr)
 			}
 			res.received += uint64(n)
-			meter.add(int64(n))
 		}
 		if errors.Is(rerr, io.EOF) {
 			return res, fmt.Errorf("получено %d байт, а заявлено %d", res.received, size)
@@ -178,6 +204,19 @@ func receiveFile(conn net.Conn, id string) (res result, err error) {
 			return res, fmt.Errorf("чтение данных: %w", rerr)
 		}
 	}
+
+	closed = true
+	if err := f.Close(); err != nil {
+		return res, fmt.Errorf("закрытие файла: %w", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return res, fmt.Errorf("проверка сохранённого файла: %w", err)
+	}
+	if uint64(info.Size()) != size {
+		return res, fmt.Errorf("размер файла на диске %d байт, а заявлено %d", info.Size(), size)
+	}
+	saved = true
 	return res, nil
 }
 
@@ -212,6 +251,15 @@ func createUnique(dir, name string) (*os.File, string, error) {
 	return nil, "", errors.New("не удалось подобрать свободное имя")
 }
 
+func isTemporary(err error) bool {
+	return errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET)
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		log.Fatalf("Использование: %s <порт>", os.Args[0])
@@ -230,18 +278,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка создания сокета: %v", err)
 	}
-	defer ln.Close()
 	log.Printf("Сервер слушает порт %d", port)
 
 	sem := make(chan struct{}, maxClients)
+	var wg sync.WaitGroup
 	clientNum := 0
 	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				log.Printf("Сокет сервера закрыт")
-				return
+			if !isTemporary(err) {
+				log.Printf("Невосстановимая ошибка принятия подключения: %v, сервер останавливается", err)
+				break
 			}
 			if delay == 0 {
 				delay = 5 * time.Millisecond
@@ -251,7 +299,7 @@ func main() {
 			if delay > time.Second {
 				delay = time.Second
 			}
-			log.Printf("Ошибка принятия подключения: %v, повтор через %v", err, delay)
+			log.Printf("Временная ошибка принятия подключения: %v, повтор через %v", err, delay)
 			time.Sleep(delay)
 			continue
 		}
@@ -261,7 +309,9 @@ func main() {
 
 		select {
 		case sem <- struct{}{}:
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				defer func() { <-sem }()
 				handleClient(conn, id)
 			}()
@@ -272,4 +322,9 @@ func main() {
 			conn.Close()
 		}
 	}
+
+	ln.Close()
+	log.Printf("Ожидание завершения активных клиентов")
+	wg.Wait()
+	os.Exit(1)
 }
