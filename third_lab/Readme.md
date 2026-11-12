@@ -10,7 +10,7 @@ go get fyne.io/fyne/v2@latest
 go get github.com/lesismal/nbio@v1.7.2
 go mod tidy
 
-Ключи передаются через переменные окружения GRAPHHOPPER_KEY и WEATHER_KEY.
+Ключи передаются через переменные окружения GRAPHHOPPER_KEY и WEATHER_KEY с помощью файла .env, в нем нужно написать:
 
 export GRAPHHOPPER_KEY="ваш_ключ"
 export WEATHER_KEY="ваш_ключ"
