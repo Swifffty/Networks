@@ -14,12 +14,19 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/joho/godotenv"
+
 	"places/asynchttp"
 	"places/geoapi"
 	"places/infolocation"
 )
 
 func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatalf("Ошибка назначения переменных окружения")
+	}
+
 	for _, key := range []string{"GRAPHHOPPER_KEY", "WEATHER_KEY"} {
 		if os.Getenv(key) == "" {
 			log.Fatalf("Задайте переменную окружения %s", key)
@@ -63,7 +70,7 @@ func main() {
 		func() int { return len(hits) },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(id widget.ListItemID, o fyne.CanvasObject) {
-			line := hitTitle(hits[id])
+			line := fmt.Sprintf("%d. %s", id+1, hitTitle(hits[id]))
 			if sub := hitSubtitle(hits[id]); sub != "" {
 				line += " — " + sub
 			}

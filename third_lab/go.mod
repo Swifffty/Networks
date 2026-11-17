@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	fyne.io/fyne/v2 v2.8.2
+	github.com/joho/godotenv v1.5.1
 	github.com/lesismal/nbio v1.7.2
 )
 

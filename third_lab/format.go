@@ -24,6 +24,7 @@ func formatWeather(info infolocation.LocationInfo) string {
 	}
 	fmt.Fprintf(&b, "Температура: %.1f °C\n", w.Main.Temp)
 	fmt.Fprintf(&b, "Влажность: %d%%\n", w.Main.Humidity)
+	fmt.Fprintf(&b, "Давление: %.0f мм рт. ст. (%d гПа)\n", float64(w.Main.Pressure)*0.750062, w.Main.Pressure)
 	fmt.Fprintf(&b, "Ветер: %.1f м/с\n", w.Wind.Speed)
 	fmt.Fprintf(&b, "Облачность: %d%%", w.Clouds.All)
 	if w.Rain != nil {
@@ -103,6 +104,8 @@ func osmTypeName(v string) string {
 		return "больница"
 	case "house":
 		return "дом"
+	case "bus_stop", "platform", "stop_position":
+		return "остановка"
 	default:
 		return ""
 	}

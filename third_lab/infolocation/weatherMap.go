@@ -23,6 +23,7 @@ type WeatherResponse struct {
 	Main struct {
 		Temp     float64 `json:"temp"`
 		Humidity int     `json:"humidity"`
+		Pressure int     `json:"pressure"`
 	} `json:"main"`
 
 	Wind struct {

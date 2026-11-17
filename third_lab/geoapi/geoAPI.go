@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	limitPlaces = "5"
+	limitPlaces = "10"
 	locale      = "ru"
 	geocodeURL  = "https://graphhopper.com/api/1/geocode"
 )
